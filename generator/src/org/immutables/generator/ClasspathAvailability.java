@@ -1,0 +1,71 @@
+/*
+   Copyright 2014 Immutables Authors and Contributors
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+ */
+package org.immutables.generator;
+
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+import javax.annotation.Nullable;
+import javax.lang.model.SourceVersion;
+import javax.lang.model.element.TypeElement;
+import com.google.common.base.Predicate;
+
+public final class ClasspathAvailability {
+  private static final Map<String, Boolean> availableClasses =
+      Collections.synchronizedMap(new HashMap<String, Boolean>());
+
+  /** Java 8 is minimum requirement now */
+  @Deprecated
+  public boolean isJava8() {
+    SourceVersion sourceVersion = EnvironmentState.processing().getSourceVersion();
+    return sourceVersion.compareTo(SourceVersion.RELEASE_7) > 0;
+  }
+
+  public final Predicate<String> available = new Predicate<String>() {
+    @Override
+    public boolean apply(String qualifiedName) {
+      @Nullable Boolean available = availableClasses.get(qualifiedName);
+      if (available == null) {
+        if (ClasspathFence.isInhibited(qualifiedName)) {
+          available = false;
+          availableClasses.put(qualifiedName, available);
+        } else {
+          TypeElement element = loadTypeElement(qualifiedName);
+          available = element != null;
+          availableClasses.put(qualifiedName, available);
+        }
+      }
+
+      return available;
+    }
+
+    private TypeElement loadTypeElement(String input) {
+      try {
+        return EnvironmentState.processing()
+            .getElementUtils()
+            .getTypeElement(input);
+      } catch (Exception ex) {
+        // if type element cannot be loaded for some reason
+        return null;
+      }
+    }
+
+    @Override
+    public String toString() {
+      return "classpath.available";
+    }
+  };
+}

@@ -1,0 +1,657 @@
+/*
+ * Copyright 2019 Immutables Authors and Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.immutables.criteria.mongo;
+
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableSet;
+import com.mongodb.client.model.Filters;
+import org.bson.BsonArray;
+import org.bson.BsonDocument;
+import org.bson.BsonNull;
+import org.bson.BsonString;
+import org.bson.BsonValue;
+import org.bson.Document;
+import org.bson.codecs.configuration.CodecRegistry;
+import org.bson.conversions.Bson;
+import org.immutables.criteria.backend.PathNaming;
+import org.immutables.criteria.expression.AbstractExpressionVisitor;
+import org.immutables.criteria.expression.Call;
+import org.immutables.criteria.expression.ComparableOperators;
+import org.immutables.criteria.expression.Constant;
+import org.immutables.criteria.expression.Expression;
+import org.immutables.criteria.expression.Expressions;
+import org.immutables.criteria.expression.IterableOperators;
+import org.immutables.criteria.expression.Operator;
+import org.immutables.criteria.expression.Operators;
+import org.immutables.criteria.expression.OptionalOperators;
+import org.immutables.criteria.expression.Path;
+import org.immutables.criteria.expression.StringOperators;
+import org.immutables.criteria.expression.Visitors;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+/**
+ * Converts find expression to Mongo BSON format
+ * @see <a href="https://docs.mongodb.com/manual/tutorial/query-documents/">Query Documents</a>
+ */
+class FindVisitor extends AbstractExpressionVisitor<Bson> {
+
+  private final PathNaming naming;
+  private final CodecRegistry codecRegistry;
+
+  FindVisitor(PathNaming pathNaming, CodecRegistry codecRegistry) {
+    super(e -> { throw new UnsupportedOperationException(); });
+    this.naming = Objects.requireNonNull(pathNaming, "pathNaming");
+    this.codecRegistry = Objects.requireNonNull(codecRegistry, "codecRegistry");
+  }
+
+  // Construct field name which is derived expression (which is expected to be a Path).
+  private String fieldName(Expression expression) {
+    return naming.name(Visitors.toPath(expression));
+  }
+
+  @Override
+  public Bson visit(Call call) {
+    final Operator op = call.operator();
+    final List<Expression> args = call.arguments();
+
+
+    if (op == OptionalOperators.IS_ABSENT || op == OptionalOperators.IS_PRESENT) {
+      Preconditions.checkArgument(args.size() == 1, "Size should be 1 for %s but was %s", op, args.size());
+      final String field = fieldName(args.get(0));
+      Bson filter;
+      if (op == OptionalOperators.IS_PRESENT) {
+        filter = Filters.and(Filters.exists(field), Filters.ne(field, null));
+      } else {
+        // absent fields means null or missing
+        filter = Filters.or(Filters.exists(field, false), Filters.eq(field, null));
+      }
+      return filter;
+    }
+
+    if (op == Operators.AND || op == Operators.OR) {
+      final List<Bson> list = call.arguments().stream()
+              .map(a -> a.accept(this))
+              .collect(Collectors.toList());
+
+      return op == Operators.AND ? Filters.and(list) : Filters.or(list);
+    }
+
+    if (op == Operators.NOT) {
+      return this.negate(args.get(0));
+    }
+
+    if (op == IterableOperators.IS_EMPTY || op == IterableOperators.NOT_EMPTY) {
+      Preconditions.checkArgument(args.size() == 1, "Size should be 1 for %s but was %s", op, args.size());
+      final String field = fieldName(args.get(0));
+      return op == IterableOperators.IS_EMPTY ? Filters.eq(field, Collections.emptyList())
+              : Filters.and(Filters.exists(field), Filters.ne(field, null), Filters.ne(field, Collections.emptyList()));
+    }
+    
+    if (op == IterableOperators.ANY) {
+      Call rightCall = call;
+      Path path = null;
+
+      while (rightCall.operator() == IterableOperators.ANY) {
+        Preconditions.checkArgument(rightCall.arguments().size() == 2, "Expected two arguments for %s got %s", rightCall, rightCall.arguments().size());
+        Preconditions.checkArgument(rightCall.arguments().get(0) instanceof Path, "%s is not a path", rightCall.arguments().get(0));
+        Preconditions.checkArgument(rightCall.arguments().get(1) instanceof Call, "%s is not a call", rightCall.arguments().get(1));
+
+        Path subPath = (Path) rightCall.arguments().get(0);
+        if (path != null) {
+          for (java.lang.reflect.Member member : subPath.members()) {
+            path = path.append(member);
+          }
+        } else {
+          path = subPath;
+        }
+        rightCall = (Call) rightCall.arguments().get(1);
+      }
+
+      // Handle AND/OR/NOT operators within ANY (for compound conditions on array elements).
+      // Also use $elemMatch for NOT_EQUAL and NOT_IN: flat dot-path $ne/$nin means "no element
+      // matches" (universal), but any().isNot/notIn requires existential ("at least one element").
+      if (rightCall.operator() == Operators.AND ||
+          rightCall.operator() == Operators.OR ||
+          rightCall.operator() == Operators.NOT ||
+          rightCall.operator() == Operators.NOT_EQUAL ||
+          rightCall.operator() == Operators.NOT_IN) {
+        final String arrayField = fieldName(path);
+        Bson condition = this.buildElemMatchCondition(rightCall);
+        return Filters.elemMatch(arrayField, condition);
+      }
+
+      // Handle simple comparison operators within ANY
+      Preconditions.checkArgument(rightCall.arguments().get(0) instanceof Path,"%s is not a path", rightCall.arguments().get(0));
+
+      // Reconstruct the full path by combining the array path with the condition path
+      Path currentPath = Visitors.toPath(rightCall.arguments().get(0));
+      List<Path> paths = new ArrayList<>();
+      while (currentPath.parent().isPresent()) {
+        paths.add(currentPath);
+        currentPath = currentPath.parent().get();
+      }
+      Collections.reverse(paths);
+      for (Path tmpPath : paths) {
+        path = Path.combine(path, tmpPath);
+      }
+
+      return this.buildCondition(rightCall, rightCall.operator(), path);
+    }
+
+    if (op.arity() == Operator.Arity.BINARY) {
+      return this.binaryCall(call);
+    }
+
+
+    throw new UnsupportedOperationException(String.format("Not yet supported (%s): %s", call.operator(), call));
+  }
+
+  private Bson binaryCall(Call call) {
+    Preconditions.checkArgument(call.operator().arity() == Operator.Arity.BINARY, "%s is not binary", call.operator());
+    final Operator op = call.operator();
+    Expression left = call.arguments().get(0);
+    Expression right = call.arguments().get(1);
+
+    if (!(left instanceof Path && right instanceof Constant)) {
+      // special case when $expr has to be used
+      return call.accept(new MongoExpr(this.naming, this.codecRegistry)).asDocument();
+    }
+
+    final String field = fieldName(left);
+    final Object value = Visitors.toConstant(right).value();
+    if (op == Operators.EQUAL || op == Operators.NOT_EQUAL) {
+      if ("".equals(value) && op == Operators.NOT_EQUAL) {
+        // special case for empty string. string != "" should not return missing strings
+        return Filters.and(Filters.nin(field, value, null), Filters.exists(field));
+      }
+      return op == Operators.EQUAL ? Filters.eq(field, value) : Filters.ne(field, value);
+    }
+
+    if (ComparableOperators.isComparable(op)) {
+      if (op == ComparableOperators.GREATER_THAN) {
+        return Filters.gt(field, value);
+      } else if (op == ComparableOperators.GREATER_THAN_OR_EQUAL) {
+        return Filters.gte(field, value);
+      } else if (op == ComparableOperators.LESS_THAN) {
+        return Filters.lt(field, value);
+      } else if (op == ComparableOperators.LESS_THAN_OR_EQUAL) {
+        return Filters.lte(field, value);
+      }
+
+      throw new UnsupportedOperationException("Unknown comparison " + call);
+    }
+
+    if (op == Operators.IN || op == Operators.NOT_IN) {
+      final Collection<Object> values = ImmutableSet.copyOf(Visitors.toConstant(right).values());
+      Preconditions.checkNotNull(values, "not expected to be null for %s", op);
+      if (values.size() == 1) {
+        // optimization: convert IN, NIN (where argument is a list with single element) into EQ / NE
+        Operators newOperator = op == Operators.IN ? Operators.EQUAL : Operators.NOT_EQUAL;
+        Call newCall = Expressions.binaryCall(newOperator, left, Expressions.constant(values.iterator().next()));
+        return this.binaryCall(newCall);
+      }
+      return op == Operators.IN ? Filters.in(field, values) : Filters.nin(field, values);
+    }
+
+    if (op == StringOperators.MATCHES || op == StringOperators.CONTAINS) {
+      Object newValue = value;
+      if (op == StringOperators.CONTAINS) {
+        // handle special case for string contains with regexp
+        newValue = Pattern.compile(".*" + Pattern.quote(value.toString()) + ".*");
+      }
+      Preconditions.checkArgument(newValue instanceof Pattern, "%s is not regex pattern", value);
+      return Filters.regex(field, (Pattern) newValue);
+    }
+
+    if (op == IterableOperators.HAS_SIZE) {
+      Preconditions.checkArgument(value instanceof Number, "%s is not a number", value);
+      int size = ((Number) value).intValue();
+      return Filters.size(field, size);
+    }
+
+    if (op == IterableOperators.CONTAINS) {
+      return Filters.eq(field, value);
+    }
+
+    if (op == StringOperators.HAS_LENGTH) {
+      Preconditions.checkArgument(value instanceof Number, "%s is not a number", value);
+      final int length = ((Number) value).intValue();
+      // use strLenCP function
+      // https://docs.mongodb.com/manual/reference/operator/aggregation/strLenCP/#exp._S_strLenCP
+      final Bson lengthExpr  = Document.parse(String.format("{$expr:{$eq:[{$strLenCP: \"$%s\"}, %d]}}}", field, length));
+      // field should exists and not be null
+      return Filters.and(Filters.exists(field), Filters.ne(field, null), lengthExpr);
+    }
+
+    if (op == StringOperators.STARTS_WITH || op == StringOperators.ENDS_WITH) {
+      // regular expression
+      final String pattern = String.format("%s%s%s",
+              op == StringOperators.STARTS_WITH ? "^": "",
+              Pattern.quote(value.toString()),
+              op == StringOperators.ENDS_WITH ? "$" : "");
+      return Filters.regex(field, Pattern.compile(pattern));
+    }
+
+
+    throw new UnsupportedOperationException(String.format("Unsupported binary call %s", call));
+  }
+
+  /**
+   * see <a href="https://docs.mongodb.com/manual/reference/operator/query/not/">mongo query manual $not</a>
+   * NOT operator is mongo is a little specific and can't be applied on all levels
+   * $not: { $or ... } will not work and should be transformed to $nor
+   */
+  private Bson negate(Expression expression) {
+    if (!(expression instanceof Call)) {
+      return Filters.not(expression.accept(this));
+    }
+
+    Call notCall = (Call) expression;
+    Operator notOperator = notCall.operator();
+
+    if (notOperator == Operators.NOT) {
+      // NOT NOT a == a
+      return notCall.arguments().get(0).accept(this);
+    } else if (notOperator == Operators.EQUAL) {
+      return this.newCall(notCall, Operators.NOT_EQUAL);
+    } else if (notOperator == Operators.NOT_EQUAL) {
+      return this.newCall(notCall, Operators.EQUAL);
+    } else if (notOperator == Operators.IN) {
+      return this.newCall(notCall, Operators.NOT_IN);
+    } else if (notOperator == Operators.NOT_IN) {
+      return this.newCall(notCall, Operators.IN);
+    } else if (notOperator == Operators.OR) {
+      return Filters.nor(notCall.arguments().stream().map(a -> a.accept(this)).collect(Collectors.toList()));
+    } else if (notOperator == Operators.AND) {
+      // NOT A and B == (NOT A) or (NOT B)
+      return Filters.or(notCall.arguments().stream().map(this::negate).collect(Collectors.toList()));
+    } else if (notOperator == OptionalOperators.IS_ABSENT || notOperator == OptionalOperators.IS_PRESENT) {
+      Operator newOp = notOperator == OptionalOperators.IS_ABSENT ? OptionalOperators.IS_PRESENT : OptionalOperators.IS_ABSENT;
+      return this.newCall(notCall, newOp);
+    } else if (notOperator == IterableOperators.IS_EMPTY || notOperator == IterableOperators.NOT_EMPTY) {
+      Operator newOp = notOperator == IterableOperators.IS_EMPTY ? IterableOperators.NOT_EMPTY : IterableOperators.IS_EMPTY;
+      return this.newCall(notCall, newOp);
+    }
+
+    // don't really know how to negate here
+    return Filters.not(notCall.accept(this));
+  }
+
+  private Bson newCall(Call existing, Operator newOperator) {
+    return this.visit(Expressions.call(newOperator, existing.arguments()));
+  }
+
+  private static Operator negateOperator(Operator operator) {
+    if (operator == Operators.EQUAL) {
+      return Operators.NOT_EQUAL;
+    } else if (operator == Operators.NOT_EQUAL) {
+      return Operators.EQUAL;
+    } else if (operator == Operators.IN) {
+      return Operators.NOT_IN;
+    } else if (operator == Operators.NOT_IN) {
+      return Operators.IN;
+    } else if (operator == OptionalOperators.IS_ABSENT) {
+      return OptionalOperators.IS_PRESENT;
+    } else if (operator == OptionalOperators.IS_PRESENT) {
+      return OptionalOperators.IS_ABSENT;
+    } else if (operator == IterableOperators.IS_EMPTY) {
+      return IterableOperators.NOT_EMPTY;
+    } else if (operator == IterableOperators.NOT_EMPTY) {
+      return IterableOperators.IS_EMPTY;
+    } else {
+      throw new UnsupportedOperationException("No negation for " + operator + " defined");
+    }
+  }
+
+  /** Simple holder for the result of unwinding consecutive ANY operators. */
+  private static class UnwoundAny {
+    final Path path;
+    final Call inner;
+    UnwoundAny(Path path, Call inner) {
+      this.path = path;
+      this.inner = inner;
+    }
+  }
+
+  /**
+   * Unwinds consecutive ANY operators, accumulating the path segments.
+   * E.g. ANY(collar.tags, inner) => UnwoundAny(collar.tags, inner)
+   */
+  private static UnwoundAny unwindAny(Call call) {
+    Path path = null;
+    while (call.operator() == IterableOperators.ANY) {
+      Preconditions.checkArgument(call.arguments().size() == 2, "Expected two arguments for ANY got %s", call.arguments().size());
+      Preconditions.checkArgument(call.arguments().get(0) instanceof Path, "%s is not a path", call.arguments().get(0));
+      Preconditions.checkArgument(call.arguments().get(1) instanceof Call, "%s is not a call", call.arguments().get(1));
+      Path subPath = (Path) call.arguments().get(0);
+      path = appendPath(path, subPath);
+      call = (Call) call.arguments().get(1);
+    }
+    return new UnwoundAny(path, call);
+  }
+
+  /**
+   * Appends all members of suffix onto prefix, returning the combined path.
+   * Returns prefix if suffix is null, suffix if prefix is null.
+   */
+  private static Path appendPath(Path prefix, Path suffix) {
+    if (suffix == null) return prefix;
+    if (prefix == null) return suffix;
+    for (java.lang.reflect.Member member : suffix.members()) {
+      prefix = prefix.append(member);
+    }
+    return prefix;
+  }
+
+  /**
+   * Recursively builds a MongoDB filter condition for use inside $elemMatch.
+   * Handles arbitrarily nested AND/OR/NOT operators by traversing the expression tree.
+   *
+   * @param expr the expression to convert (must be a Call)
+   * @return a Bson filter suitable for use inside Filters.elemMatch()
+   */
+  private Bson buildElemMatchCondition(Expression expr) {
+    return this.buildElemMatchCondition(expr, null);
+  }
+
+  private Bson buildElemMatchCondition(Expression expr, Path anyPrefix) {
+    if (!(expr instanceof Call)) {
+      throw new IllegalArgumentException("Expected Call but got " + expr);
+    }
+
+    Call call = (Call) expr;
+    Operator op = call.operator();
+
+    // Handle AND/OR recursively
+    if (op == Operators.AND || op == Operators.OR) {
+      List<Bson> conditions = new ArrayList<>();
+
+      for (Expression arg : call.arguments()) {
+        Preconditions.checkArgument(arg instanceof Call, "Expected Call but got %s", arg);
+        Call argCall = (Call) arg;
+
+        if (argCall.operator() == Operators.AND || argCall.operator() == Operators.OR) {
+          conditions.add(this.buildElemMatchCondition(arg, anyPrefix));
+        } else if (argCall.operator() == IterableOperators.ANY) {
+          // Nested ANY inside AND/OR: unwind and dispatch
+          UnwoundAny unwound = unwindAny(argCall);
+          Path nestedPrefix = appendPath(anyPrefix, unwound.path);
+          Call inner = unwound.inner;
+          if (inner.operator() == Operators.AND || inner.operator() == Operators.OR || inner.operator() == Operators.NOT) {
+            conditions.add(this.buildElemMatchCondition(inner, nestedPrefix));
+          } else {
+            conditions.add(this.buildLeafCondition(inner, nestedPrefix));
+          }
+        } else {
+          conditions.add(this.buildLeafCondition(argCall, anyPrefix));
+        }
+      }
+
+      return op == Operators.AND ? Filters.and(conditions) : Filters.or(conditions);
+    }
+
+    // For top-level NOT or leaf conditions
+    return this.buildLeafCondition(call, anyPrefix);
+  }
+
+  private Bson buildLeafCondition(Call call, Path anyPrefix) {
+    Operator operator = call.operator();
+
+    // Handle NOT operator by unwrapping and negating the inner operator
+    if (operator == Operators.NOT) {
+      Preconditions.checkArgument(call.arguments().get(0) instanceof Call, "%s is not a call", call.arguments().get(0));
+      call = (Call) call.arguments().get(0);
+
+      // Unwrap any nested ANY operators, accumulating path into anyPrefix
+      if (call.operator() == IterableOperators.ANY) {
+        UnwoundAny unwound = unwindAny(call);
+        anyPrefix = appendPath(anyPrefix, unwound.path);
+        call = unwound.inner;
+      }
+
+      // If after unwrapping we find AND/OR, apply De Morgan's laws
+      if (call.operator() == Operators.AND || call.operator() == Operators.OR) {
+        return this.applyDeMorgansLaw(call, anyPrefix);
+      }
+
+      operator = negateOperator(call.operator());
+    } else {
+      operator = call.operator();
+    }
+
+    // Extract and reconstruct the path
+    Preconditions.checkArgument(call.arguments().get(0) instanceof Path, "%s is not a path", call.arguments().get(0));
+    Path fullPath = reconstructFullPath(Visitors.toPath(call.arguments().get(0)));
+    fullPath = appendPath(anyPrefix, fullPath);
+
+    if (fullPath == null) {
+      // Scalar array element inside $elemMatch — no field name needed
+      return this.buildScalarElemMatchCondition(call, operator);
+    }
+
+    // Build the final condition
+    return this.buildCondition(call, operator, fullPath);
+  }
+
+  private Bson applyDeMorgansLaw(Call call, Path anyPrefix) {
+    Operator op = call.operator();
+    List<Bson> negatedConditions = new ArrayList<>();
+
+    for (Expression arg : call.arguments()) {
+      Call negatedArg = Expressions.unaryCall(Operators.NOT, arg);
+      negatedConditions.add(this.buildLeafCondition(negatedArg, anyPrefix));
+    }
+
+    // Apply De Morgan's law: flip AND <-> OR
+    return op == Operators.AND ? Filters.or(negatedConditions) : Filters.and(negatedConditions);
+  }
+
+  /**
+   * Builds a MongoDB filter from a call, operator, and path.
+   * Creates either a unary expression (using the call's original operator) or
+   * a binary expression (using the provided operator, which may be negated).
+   *
+   * @param call the original call (used for arity and second argument if binary)
+   * @param operator the operator to use (may be negated from call's operator)
+   * @param path the path to use in the expression
+   * @return a Bson filter for this condition
+   */
+  private Bson buildCondition(Call call, Operator operator, Path path) {
+    if (call.operator().arity() == Operator.Arity.UNARY) {
+      return this.visit(Expressions.unaryCall(call.operator(), path));
+    } else {
+      return this.binaryCall(Expressions.binaryCall(operator, path, call.arguments().get(1)));
+    }
+  }
+
+  /**
+   * Builds a field-less condition for scalar array elements inside $elemMatch.
+   * E.g. for NOT_EQUAL + "rescue" produces {$ne: "rescue"}.
+   */
+  private Bson buildScalarElemMatchCondition(Call call, Operator operator) {
+    Preconditions.checkArgument(call.operator().arity() == Operator.Arity.BINARY,
+        "Scalar conditions must be binary, got %s", call.operator());
+    Object value = Visitors.toConstant(call.arguments().get(1)).value();
+    String dummyField = "_";
+    Bson filter;
+    if (operator == Operators.EQUAL) {
+      filter = Filters.eq(dummyField, value);
+    } else if (operator == Operators.NOT_EQUAL) {
+      filter = Filters.ne(dummyField, value);
+    } else if (operator == Operators.IN) {
+      Collection<?> values = ImmutableSet.copyOf(Visitors.toConstant(call.arguments().get(1)).values());
+      filter = Filters.in(dummyField, values);
+    } else if (operator == Operators.NOT_IN) {
+      Collection<?> values = ImmutableSet.copyOf(Visitors.toConstant(call.arguments().get(1)).values());
+      filter = Filters.nin(dummyField, values);
+    } else if (operator == ComparableOperators.GREATER_THAN) {
+      filter = Filters.gt(dummyField, value);
+    } else if (operator == ComparableOperators.GREATER_THAN_OR_EQUAL) {
+      filter = Filters.gte(dummyField, value);
+    } else if (operator == ComparableOperators.LESS_THAN) {
+      filter = Filters.lt(dummyField, value);
+    } else if (operator == ComparableOperators.LESS_THAN_OR_EQUAL) {
+      filter = Filters.lte(dummyField, value);
+    } else {
+      throw new UnsupportedOperationException("Unsupported scalar elemMatch operator: " + operator);
+    }
+    // Extract operator subdocument: {_: {$ne: val}} -> {$ne: val}
+    BsonDocument doc = filter.toBsonDocument(BsonDocument.class, this.codecRegistry);
+    BsonValue inner = doc.get(dummyField);
+    if (inner.isDocument()) {
+      return inner.asDocument();
+    }
+    // For equality: Filters.eq produces {_: val} not {_: {$eq: val}}
+    return new BsonDocument("$eq", inner);
+  }
+
+  /**
+   * Reconstructs a full path from a potentially partial path by walking up the parent chain.
+   */
+  private static Path reconstructFullPath(Path path) {
+    List<Path> paths = new ArrayList<>();
+    Path current = path;
+    while (current.parent().isPresent()) {
+      paths.add(current);
+      current = current.parent().get();
+    }
+    Collections.reverse(paths);
+
+    Path result = null;
+    for (Path p : paths) {
+      result = Path.combine(result, p);
+    }
+    return result;
+  }
+
+  /**
+   * Visitor used when special {@code $expr} needs to be generated like {@code field1 == field2}
+   * in mongo it would look like:
+   *
+   * <pre>
+   *   {@code
+   *     $expr: {
+   *     $eq: [
+   *       "$field1",
+   *       "$field2"
+   *     ]
+   *   }
+   *   }
+   * </pre>
+   * @see <a href="https://docs.mongodb.com/manual/reference/operator/query/expr/">$expr</a>
+   */
+  private static class MongoExpr extends AbstractExpressionVisitor<BsonValue> {
+    private final PathNaming pathNaming;
+    private final CodecRegistry codecRegistry;
+
+    private MongoExpr(PathNaming pathNaming, CodecRegistry codecRegistry) {
+      super(e -> { throw new UnsupportedOperationException(); });
+      this.pathNaming = pathNaming;
+      this.codecRegistry = codecRegistry;
+    }
+
+    @Override
+    public BsonValue visit(Call call) {
+      Operator op = call.operator();
+      if (op.arity() == Operator.Arity.BINARY) {
+        return this.visitBinary(call, call.arguments().get(0), call.arguments().get(1));
+      }
+
+      if (op.arity() == Operator.Arity.UNARY) {
+        return this.visitUnary(call, call.arguments().get(0));
+      }
+
+
+      throw new UnsupportedOperationException("Don't know how to handle " + call);
+    }
+
+    private BsonValue visitBinary(Call call, Expression left, Expression right) {
+      Operator op = call.operator();
+
+      String mongoOp;
+      if (op == Operators.EQUAL) {
+        mongoOp = "$eq";
+      } else if (op == Operators.NOT_EQUAL) {
+        mongoOp = "$ne";
+      } else if (op == Operators.IN) {
+        mongoOp = "$in";
+      } else if (op == Operators.NOT_IN) {
+        mongoOp = "$in"; // will be wrapped in $not: {$not: {$in: ... }}
+      } else {
+        throw new UnsupportedOperationException(String.format("Unknown operator %s for call %s", op, call));
+      }
+
+      BsonArray args = new BsonArray();
+      args.add(left.accept(this));
+      args.add(right.accept(this));
+
+      BsonDocument expr = new BsonDocument(mongoOp, args);
+      if (op == Operators.NOT_IN) {
+        // for aggregations $nin does not work
+        // use {$not: {$in: ... }} instead
+        expr = new BsonDocument("$not", expr);
+      }
+
+      return Filters.expr(expr).toBsonDocument(BsonDocument.class, this.codecRegistry);
+    }
+
+    private BsonValue visitUnary(Call call, Expression arg) {
+      Operator op = call.operator();
+
+      if (op == StringOperators.TO_LOWER_CASE || op == StringOperators.TO_UPPER_CASE) {
+        String key = op == StringOperators.TO_LOWER_CASE ? "$toLower" : "$toUpper";
+        BsonValue value = arg.accept(this);
+        return new BsonDocument(key, value);
+      }
+
+      throw new UnsupportedOperationException("Unknown unary call " + call);
+    }
+
+    @Override
+    public BsonValue visit(Path path) {
+      // in mongo expressions fields are referenced as $field
+      return new BsonString('$' + this.pathNaming.name(path));
+    }
+
+    @Override
+    public BsonValue visit(Constant constant) {
+      Object value = constant.value();
+      if (value == null) {
+        return BsonNull.VALUE;
+      }
+
+      if (value instanceof Iterable) {
+        return Filters.in("ignore", (Iterable<?>) value)
+                .toBsonDocument(BsonDocument.class, this.codecRegistry)
+                .get("ignore").asDocument()
+                .get("$in").asArray();
+      }
+
+      return Filters.eq("ignore", value)
+              .toBsonDocument(BsonDocument.class, this.codecRegistry)
+              .get("ignore");
+    }
+  }
+
+}
